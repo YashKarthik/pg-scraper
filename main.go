@@ -29,12 +29,61 @@ func main() {
     }
 
     articleLinks := getArticleLinks(document)
-
+    var articles []Article
+    articlesChan := make(chan Article)
+    failedArticlesChan := make(chan string)
     var wg sync.WaitGroup
-    for _, articleLink := range articleLinks[60:] {
+
+    for i, articleLink := range articleLinks {
         wg.Add(1)
-        getArticle(articleLink, &wg)
+        go func(articleLink string, articlesChan chan Article, i int) {
+            defer wg.Done()
+            article, err := getArticle(articleLink)
+            if err != nil {
+                fmt.Println("🟡", articleLink)
+                failedArticlesChan <- articleLink
+                return;
+            }
+            articlesChan <- article
+        }(articleLink, articlesChan, i)
     }
+
+    var wg2 sync.WaitGroup
+
+    wg2.Add(1)
+    go func() {
+        defer wg2.Done()
+        wg.Wait()
+        close(articlesChan)
+        close(failedArticlesChan)
+    }()
+
+    wg2.Add(1)
+    go func() {
+        defer wg2.Done()
+        for article := range articlesChan {
+            defaultArticle := Article{}
+            if article == defaultArticle { continue }
+            fmt.Println("🟩", article.title)
+            articles = append(articles, article)
+        }
+    }()
+
+
+    var failedArticles []string
+    wg2.Add(1)
+    go func() {
+        defer wg2.Done()
+        for failedArticle := range failedArticlesChan {
+            if failedArticle == "" { continue }
+            fmt.Println("🟥", failedArticle)
+            failedArticles = append(failedArticles, failedArticle)
+        }
+    }()
+
+    wg2.Wait()
+    fmt.Println(articles)
+    fmt.Println(failedArticles)
 }
 
 func getArticleLinks(node *html.Node) []string {
@@ -79,37 +128,36 @@ type Article struct {
     date    string
 }
 
-func getArticle(articleUrl string, wg *sync.WaitGroup) (Article, error) {
-    defer wg.Done()
+func getArticle(articleUrl string) (Article, error) {
     if articleUrl == "" {
         return Article{}, errors.New("Empty articleUrl")
     }
 
     res, err := http.Get("http://paulgraham.com/" + articleUrl)
     if err != nil {
-        log.Println("Could not get article:", err.Error())
+        log.Println("❌ Could not get article:", err.Error())
     }
     defer res.Body.Close()
 
     if res.StatusCode != http.StatusOK {
-        log.Fatal("res.Status not OK:\n", res.Status)
+        log.Fatal("❌ res.Status not OK:\n", res.Status)
     }
 
     articleNode, err := html.Parse(res.Body)
     if err != nil {
-        log.Println("Couldn't read body: \n", articleUrl, "\n", err)
+        log.Println("❌ Couldn't read body: \n", articleUrl, "\n", err)
         return Article{}, err
     }
 
     date, err := getArticleDate(articleNode)
     if err != nil {
-        log.Println("No date: " + articleUrl)
+        log.Println("❌ No date: " + articleUrl)
         return Article{}, err
     }
 
     title, err := getArticleTitle(articleNode)
     if err != nil {
-        log.Println("No title." + articleUrl)
+        log.Println("❌ No title." + articleUrl)
         return Article{}, err
     }
 
@@ -119,7 +167,6 @@ func getArticle(articleUrl string, wg *sync.WaitGroup) (Article, error) {
         title: title,
     }
 
-    fmt.Println(article)
     return article, nil
 }
 
