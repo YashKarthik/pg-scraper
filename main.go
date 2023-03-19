@@ -5,7 +5,9 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"regexp"
 	"strings"
+	"sync"
 
 	"golang.org/x/net/html"
 )
@@ -27,8 +29,12 @@ func main() {
     }
 
     articleLinks := getArticleLinks(document)
-    fmt.Println(articleLinks[2])
-    fmt.Println(getArticle(articleLinks[2]))
+
+    var wg sync.WaitGroup
+    for _, articleLink := range articleLinks[60:] {
+        wg.Add(1)
+        getArticle(articleLink, &wg)
+    }
 }
 
 func getArticleLinks(node *html.Node) []string {
@@ -55,7 +61,12 @@ func parseAnchorTag(tag html.Attribute) (string, error) {
         return "", errors.New("Expected Anchor Tag, but received something else.")
     }
 
-    if strings.Contains(tag.Val, "/") {
+    /** On PG's website internal links have only their route name
+        => <a href="getideas.com">...</a> == paulgraham.com/getideas.html
+        Also don't scrape rss.html and index.html
+        All other links on page are not inside <a></a>; they are inside <area></area> represting a sidebar.
+    */
+    if strings.Contains(tag.Val, "/") || tag.Val == "rss.html" || tag.Val == "index.html" {
         return "", errors.New("Not article link.")
     }
     return tag.Val, nil
@@ -68,7 +79,12 @@ type Article struct {
     date    string
 }
 
-func getArticle(articleUrl string) Article {
+func getArticle(articleUrl string, wg *sync.WaitGroup) (Article, error) {
+    defer wg.Done()
+    if articleUrl == "" {
+        return Article{}, errors.New("Empty articleUrl")
+    }
+
     res, err := http.Get("http://paulgraham.com/" + articleUrl)
     if err != nil {
         log.Println("Could not get article:", err.Error())
@@ -81,39 +97,53 @@ func getArticle(articleUrl string) Article {
 
     articleNode, err := html.Parse(res.Body)
     if err != nil {
-        log.Fatal("Couldn't read body: \n", err)
+        log.Println("Couldn't read body: \n", articleUrl, "\n", err)
+        return Article{}, err
     }
 
     date, err := getArticleDate(articleNode)
     if err != nil {
-        log.Fatal("No date.")
+        log.Println("No date: " + articleUrl)
+        return Article{}, err
     }
 
     title, err := getArticleTitle(articleNode)
     if err != nil {
-        log.Fatal("No title.")
+        log.Println("No title." + articleUrl)
+        return Article{}, err
     }
 
-    return Article{
+    article := Article{
         link: articleUrl,
         date: date,
         title: title,
     }
+
+    fmt.Println(article)
+    return article, nil
 }
 
+
 func getArticleDate(articleNode *html.Node) (string, error) {
-    fmt.Println("starting")
-    if articleNode.Type == html.ElementNode && articleNode.Data == "font" {
+    if articleNode.Type == html.ElementNode && (articleNode.Data == "font" || articleNode.Data == "p") {
         for node := articleNode.FirstChild; node != nil; node = node.NextSibling {
             if node.Type == html.TextNode {
-                fmt.Println(node.Data, "hele")
-                return node.Data, nil
+                if matched, _ := regexp.MatchString(`^\w+ \d{4}$`, node.Data); matched {
+                    return node.Data, nil
+                } else if matched, _ := regexp.MatchString(`^\n\w+ \d{4}$`, node.Data); matched {
+                    return node.Data[1:], nil
+                } else {
+                    break
+                }
             }
         }
     }
 
     for child := articleNode.FirstChild; child != nil; child = child.NextSibling {
-        getArticleDate(child)
+        date, err := getArticleDate(child)
+        if err == nil {
+            return date, nil
+        }
     }
 
     return "", errors.New("Could not get date")
@@ -129,7 +159,10 @@ func getArticleTitle(articleNode *html.Node) (string, error) {
     }
 
     for child := articleNode.FirstChild; child != nil; child = child.NextSibling {
-        getArticleTitle(child)
+        title, err := getArticleTitle(child)
+        if err == nil {
+            return title, err
+        }
     }
 
     return "", errors.New("Could not get title.")
