@@ -8,11 +8,14 @@ import (
 	"regexp"
 	"strings"
 	"sync"
+	"time"
 
+	"github.com/gorilla/feeds"
 	"golang.org/x/net/html"
 )
 
 func main() {
+    fmt.Println("Fetching essays archive")
     res, err := http.Get("http://paulgraham.com/articles.html")
     if err != nil {
         log.Fatal("Couldn't GET: \n", err)
@@ -23,17 +26,21 @@ func main() {
         log.Fatal("res.Status not OK:\n", res.Status)
     }
 
+    fmt.Println("Parsing archive page html")
     document, err := html.Parse(res.Body)
     if err != nil {
         log.Fatal("Couldn't read body: \n", err)
     }
 
+    fmt.Println("Generating list of essays")
     articleLinks := getArticleLinks(document)
+
     var articles []Article
     articlesChan := make(chan Article)
     failedArticlesChan := make(chan string)
-    var wg sync.WaitGroup
 
+    fmt.Println("Fetching and parsing essays")
+    var wg sync.WaitGroup
     for i, articleLink := range articleLinks {
         wg.Add(1)
         go func(articleLink string, articlesChan chan Article, i int) {
@@ -42,7 +49,8 @@ func main() {
             if err != nil {
                 fmt.Println("🟡", articleLink)
                 failedArticlesChan <- articleLink
-                return;
+                // not returning cuz this still returns an article, with default date,
+                // which we handle in next line
             }
             articlesChan <- article
         }(articleLink, articlesChan, i)
@@ -53,6 +61,7 @@ func main() {
     wg2.Add(1)
     go func() {
         defer wg2.Done()
+        fmt.Println("Fetched and parsed all essays")
         wg.Wait()
         close(articlesChan)
         close(failedArticlesChan)
@@ -64,7 +73,6 @@ func main() {
         for article := range articlesChan {
             defaultArticle := Article{}
             if article == defaultArticle { continue }
-            fmt.Println("🟩", article.title)
             articles = append(articles, article)
         }
     }()
@@ -76,14 +84,38 @@ func main() {
         defer wg2.Done()
         for failedArticle := range failedArticlesChan {
             if failedArticle == "" { continue }
-            fmt.Println("🟥", failedArticle)
             failedArticles = append(failedArticles, failedArticle)
         }
     }()
 
     wg2.Wait()
-    fmt.Println(articles)
-    fmt.Println(failedArticles)
+    fmt.Println("🟩", articles)
+    fmt.Println("🟥", failedArticles)
+
+    feed := &feeds.Feed{
+        Title: "Essays by Paul Graham",
+        Link: &feeds.Link{Href: "http://paulgraham.com/articles.html"},
+        Description: "Scraped feed of paulgraham.com provided by yashkarthik.xyz",
+        Author: &feeds.Author{Name: "Paul Graham"},
+        Created: time.Now(),
+    }
+
+    fmt.Println("Generating RSS feed")
+    for _, feedItem := range articles {
+        feed.Items = append(feed.Items, &feeds.Item{
+            Title: feedItem.title,
+            Link: &feeds.Link{Href: "http://paulgraham.com/"+feedItem.link},
+            Description: "Essay by Paul Graham on " + feedItem.title,
+            Created: feedItem.date,
+        })
+    }
+
+    rss, err := feed.ToRss()
+    if err != nil {
+        log.Fatal("Couldn't generate feed.")
+    }
+
+    fmt.Println("RSS feed:\n", rss)
 }
 
 func getArticleLinks(node *html.Node) []string {
@@ -125,7 +157,7 @@ func parseAnchorTag(tag html.Attribute) (string, error) {
 type Article struct {
     link    string
     title   string
-    date    string
+    date    time.Time
 }
 
 func getArticle(articleUrl string) (Article, error) {
@@ -149,36 +181,50 @@ func getArticle(articleUrl string) (Article, error) {
         return Article{}, err
     }
 
-    date, err := getArticleDate(articleNode)
-    if err != nil {
-        log.Println("❌ No date: " + articleUrl)
-        return Article{}, err
-    }
-
     title, err := getArticleTitle(articleNode)
     if err != nil {
         log.Println("❌ No title." + articleUrl)
         return Article{}, err
     }
 
-    article := Article{
+    date, err := getArticleDate(articleNode)
+    if err != nil {
+        log.Println("❌ No date: " + articleUrl + "\n" + err.Error())
+        return Article{
+            link: articleUrl,
+            title: title,
+            date: time.Now(),
+        }, err
+    }
+
+    return Article{
         link: articleUrl,
         date: date,
         title: title,
-    }
-
-    return article, nil
+    }, nil
 }
 
 
-func getArticleDate(articleNode *html.Node) (string, error) {
+func getArticleDate(articleNode *html.Node) (time.Time, error) {
+    dateLayout := "January 2006"
+
     if articleNode.Type == html.ElementNode && (articleNode.Data == "font" || articleNode.Data == "p") {
         for node := articleNode.FirstChild; node != nil; node = node.NextSibling {
             if node.Type == html.TextNode {
                 if matched, _ := regexp.MatchString(`^\w+ \d{4}$`, node.Data); matched {
-                    return node.Data, nil
+                    t, err := time.Parse(dateLayout, node.Data)
+                    if err != nil {
+                        fmt.Println(err.Error())
+                        return time.Time{}, errors.New("Could not get date" + err.Error())
+                    }
+                    return t, nil
                 } else if matched, _ := regexp.MatchString(`^\n\w+ \d{4}$`, node.Data); matched {
-                    return node.Data[1:], nil
+                    t, err := time.Parse(dateLayout, node.Data[1:])
+                    if err != nil {
+                        fmt.Println(err.Error())
+                        return time.Time{}, errors.New("Could not get date" + err.Error())
+                    }
+                    return t, nil
                 } else {
                     break
                 }
@@ -193,7 +239,7 @@ func getArticleDate(articleNode *html.Node) (string, error) {
         }
     }
 
-    return "", errors.New("Could not get date")
+    return time.Time{}, errors.New("Could not get date")
 }
 
 func getArticleTitle(articleNode *html.Node) (string, error) {
